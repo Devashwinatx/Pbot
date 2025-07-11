@@ -266,7 +266,7 @@ async def handle_cover_or_video(client, message):
     # Any other state where we received an image or document unexpectedly
     if step == 'awaiting_confirmation':
         await message.reply_text("⚠️ Please press the **Send** button to post the preview, or /cancel to abort.")
-   @app.on_message(filters.text)
+@app.on_message(filters.text)
 async def handle_text_fallback(client, message):
     """
     Catch-all for when text is sent instead of expected media.
