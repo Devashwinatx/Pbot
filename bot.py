@@ -1,137 +1,129 @@
-import re
-import os
+import base64
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 
 API_ID = 28015531
 API_HASH = "2ab4ba37fd5d9ebf1353328fc915ad28"
 BOT_TOKEN = "7514636092:AAFY3O_h8NAaRMUlDv1dDEuZDhzxItCHHy0"
-TARGET_CHANNEL = -1002445548441
-DB_CHANNEL = -1002316552580
 
-bot = Client(
-    "AutoPostBot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
+DB_CHANNEL = -1002316552580  # your DB channel ID
+TARGET_CHANNEL = -1002445548441  # your post channel ID
+BOT_USERNAME = "FastAutoRenamebot"  # your bot's username without @
 
-user_sessions = {}
+app = Client("anime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Extract title, season, episode from filename
-def parse_filename(filename: str):
-    match = re.search(r"(.+?)\s+[sS](\d+)[\s_-]*[eE]p?\[?(\d+)\]?.*\[(\d+p)\]", filename)
-    if match:
-        title = match.group(1).strip()
-        season = match.group(2)
-        episode = match.group(3)
-        quality = match.group(4)
-        return title, season, episode, quality
-    return None, None, None, None
+user_data = {}
+shared_files = {}  # stores file_id to send later via /start link
 
-@bot.on_message(filters.private & filters.command("start"))
-async def start_command(client, message):
-    user_sessions[message.from_user.id] = {"stage": "cover"}
-    await message.reply("👋 Send the **cover photo**.")
 
-@bot.on_message(filters.private & filters.photo)
-async def handle_cover(client, message):
-    session = user_sessions.get(message.from_user.id)
-    if session and session.get("stage") == "cover":
-        session["cover"] = message.photo.file_id
-        session["stage"] = "files"
-        session["videos"] = []
-        await message.reply("📁 Now send the **3 video files** (480p, 720p, 1080p).")
+# Step 1: Get cover photo
+@app.on_message(filters.private & filters.photo)
+async def ask_videos(client, message: Message):
+    user_data[message.from_user.id] = {"cover": message.photo.file_id}
+    await message.reply("✅ Cover received.\nNow send 3 video files (480p, 720p, 1080p).")
 
-@bot.on_message(filters.private & (filters.document | filters.video))
-async def handle_files(client, message):
-    session = user_sessions.get(message.from_user.id)
-    if not session or session.get("stage") != "files":
+
+# Step 2: Get videos and generate deep links
+@app.on_message(filters.private & filters.video)
+async def handle_video(client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in user_data or "cover" not in user_data[user_id]:
+        await message.reply("❗ Please send a cover photo first.")
         return
 
-    file_name = message.document.file_name if message.document else message.video.file_name
+    file = message.video
+    filename = file.file_name or ""
+    quality = None
 
-    # Validate resolution
-    if not re.search(r"\[(480p|720p|1080p)\]", file_name):
-        await message.reply("❗ Filename must contain [480p], [720p], or [1080p].")
+    if "480p" in filename:
+        quality = "480p"
+    elif "720p" in filename:
+        quality = "720p"
+    elif "1080p" in filename:
+        quality = "1080p"
+    else:
+        await message.reply("❌ Filename must include quality like 480p/720p/1080p.")
         return
 
-    # Save message and parse metadata
-    session["videos"].append(message)
+    # Extract title and episode
+    parts = filename.split()
+    title = parts[0] if parts else "Unknown"
+    season = "S01"
+    episode = "E01"
+    for part in parts:
+        if part.startswith("S"):
+            season = part
+        elif "Ep" in part or part.startswith("E"):
+            episode = part
 
-    if len(session["videos"]) == 3:
-        # Extract metadata from one of the files
-        title, season, episode, _ = parse_filename(file_name)
-        if not all([title, season, episode]):
-            await message.reply("❌ Couldn't parse title, season, or episode from filename.")
-            return
+    user_data[user_id]["title"] = title
+    user_data[user_id]["season"] = season
+    user_data[user_id]["episode"] = episode
 
-        session["title"] = title
-        session["season"] = season
-        session["episode"] = episode
-        session["stage"] = "confirm"
+    # Forward to DB channel
+    forwarded = await file.copy(chat_id=DB_CHANNEL)
+    file_id = forwarded.video.file_id
+    encoded = base64.urlsafe_b64encode(f"get-{file_id}".encode()).decode()
 
-        caption = f"▶️ <b>{title}</b>\n\n» Season : {season}\n» Episode : {episode}\n» Language : Tamil\n» Codec : HEVC\n» Quality : 480p, 720p, 1080p"
+    shared_files[encoded] = file_id
+    user_data[user_id][quality] = encoded
 
+    # Once all 3 qualities are ready
+    if all(k in user_data[user_id] for k in ["480p", "720p", "1080p"]):
         buttons = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("480p", url="https://t.me/AnimeTamilFilesBot"),
-                InlineKeyboardButton("720p", url="https://t.me/AnimeTamilFilesBot"),
-                InlineKeyboardButton("1080p", url="https://t.me/AnimeTamilFilesBot")
+                InlineKeyboardButton("480p", url=f"https://t.me/{BOT_USERNAME}?start={user_data[user_id]['480p']}"),
+                InlineKeyboardButton("720p", url=f"https://t.me/{BOT_USERNAME}?start={user_data[user_id]['720p']}"),
+                InlineKeyboardButton("1080p", url=f"https://t.me/{BOT_USERNAME}?start={user_data[user_id]['1080p']}")
             ],
-            [InlineKeyboardButton("✅ Send", callback_data="send"), InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+            [InlineKeyboardButton("✅ Post", callback_data="send"), InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
         ])
+        caption = f"**{title} {season} {episode}**"
+        await message.reply_photo(user_data[user_id]["cover"], caption=caption, reply_markup=buttons)
 
-        await message.reply_photo(
-            photo=session["cover"],
-            caption=caption,
-            reply_markup=buttons
-        )
 
-@bot.on_callback_query()
-async def handle_buttons(client, callback_query):
-    data = callback_query.data
-    user_id = callback_query.from_user.id
-    session = user_sessions.get(user_id)
-
-    if not session:
-        await callback_query.answer("Session expired.", show_alert=True)
+# Step 3: Handle send/cancel
+@app.on_callback_query(filters.regex("send|cancel"))
+async def confirm_post(client, query: CallbackQuery):
+    user_id = query.from_user.id
+    if query.data == "cancel":
+        user_data.pop(user_id, None)
+        await query.message.edit("❌ Post canceled.")
         return
 
-    if data == "cancel":
-        user_sessions.pop(user_id, None)
-        await callback_query.message.edit("❌ Cancelled.")
-    elif data == "send":
-        cover = session["cover"]
-        title = session["title"]
-        season = session["season"]
-        episode = session["episode"]
-        videos = session["videos"]
+    data = user_data.get(user_id)
+    if not data:
+        await query.message.edit("⚠️ Session expired.")
+        return
 
-        caption = f"▶️ <b>{title}</b>\n\n» Season : {season}\n» Episode : {episode}\n» Language : Tamil\n» Codec : HEVC\n» Quality : 480p, 720p, 1080p"
+    buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("480p", url=f"https://t.me/{BOT_USERNAME}?start={data['480p']}"),
+            InlineKeyboardButton("720p", url=f"https://t.me/{BOT_USERNAME}?start={data['720p']}"),
+            InlineKeyboardButton("1080p", url=f"https://t.me/{BOT_USERNAME}?start={data['1080p']}")
+        ]
+    ])
+    caption = f"**{data['title']} {data['season']} {data['episode']}**"
+    await client.send_photo(chat_id=TARGET_CHANNEL, photo=data["cover"], caption=caption, reply_markup=buttons)
+    await query.message.edit("✅ Posted to channel.")
+    user_data.pop(user_id)
 
-        buttons = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("480p", url=f"https://t.me/{client.me.username}?start=dl480_{videos[0].id}"),
-                InlineKeyboardButton("720p", url=f"https://t.me/{client.me.username}?start=dl720_{videos[1].id}"),
-                InlineKeyboardButton("1080p", url=f"https://t.me/{client.me.username}?start=dl1080_{videos[2].id}")
-            ]
-        ])
 
-        # Forward files to DB channel
-        for vid in videos:
-            await vid.forward(DB_CHANNEL)
+# Step 4: Deep link handler
+@app.on_message(filters.command("start") & filters.private)
+async def start_cmd(client, message: Message):
+    if len(message.command) > 1:
+        param = message.command[1]
+        try:
+            decoded = base64.urlsafe_b64decode(param).decode()
+            if decoded.startswith("get-"):
+                file_id = decoded[4:]
+                await message.reply_video(video=file_id, caption="🎬 Here's your file!")
+                return
+        except Exception:
+            pass
+        await message.reply("❌ Invalid or expired file link.")
+    else:
+        await message.reply("👋 Send a cover photo to begin creating an anime post.")
 
-        # Post to target channel
-        await client.send_photo(
-            chat_id=TARGET_CHANNEL,
-            photo=cover,
-            caption=caption,
-            reply_markup=buttons
-        )
-
-        await callback_query.message.edit("✅ Sent to channel.")
-        user_sessions.pop(user_id, None)
-
-bot.run()
-    
+app.run()
