@@ -1,128 +1,203 @@
-import logging
-from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+# bot.py
 import re
+import os
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-# Credentials (Only for test use; don't expose in production)
-API_ID = 28015531
-API_HASH = "2ab4ba37fd5d9ebf1353328fc915ad28"
-BOT_TOKEN = "7514636092:AAFY3O_h8NAaRMUlDv1dDEuZDhzxItCHHy0"
-TARGET_CHANNEL = -1002445548441
-DB_CHANNEL = -1002316552580
+# --- Configuration (replace placeholders) ---
+API_ID = 28015531                 # e.g. 123456
+API_HASH = "2ab4ba37fd5d9ebf1353328fc915ad28"           # e.g. "abcdef1234567890abcdef1234567890"
+BOT_TOKEN = "7514636092:AAFY3O_h8NAaRMUlDv1dDEuZDhzxItCHHy0"         # e.g. "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+ADMIN_ID = 6121610691             # e.g. 123456789 (only this user can upload)
+TARGET_CHANNEL = -1002445548441      # target channel ID (as given)
+DB_CHANNEL = -1002316552580          # database channel ID (as given)
 
-logging.basicConfig(level=logging.INFO)
-bot = Client("AnimePostBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Initialize the Pyrogram client
+app = Client("anime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-user_data = {}
+# State storage for the current upload session (by admin user ID)
+admin_data = {}  # will hold {'cover': file_id, 'title': str, 'season': int, 'episode': int, 'videos': {}, 'db_ids': {}}
 
-@bot.on_message(filters.private & filters.command("start"))
-async def start_cmd(client, message: Message):
-    if message.text.startswith("/start vid_"):
-        video_id = message.text.split("vid_")[1]
-        try:
-            await client.forward_messages(
-                chat_id=message.chat.id,
-                from_chat_id=DB_CHANNEL,
-                message_ids=int(video_id)
-            )
-        except Exception:
-            await message.reply("❌ File not found or expired.")
+# Regex pattern for filename: Title S01 Ep01 [720p].mkv
+file_pattern = re.compile(r"^(.+?) S(\d+) Ep(\d+) (\d+p)\.mkv$")
+
+# Handler: /cancel command (admin only) to reset the current upload
+@app.on_message(filters.command("cancel") & filters.user(ADMIN_ID))
+async def cancel_upload(client, message):
+    """Allow admin to cancel the current upload process."""
+    admin_data.pop(message.from_user.id, None)
+    await message.reply("Upload cancelled. Send a cover image to start over.")
+
+# Handler: Cover image from admin
+@app.on_message(filters.photo & filters.user(ADMIN_ID) & filters.private)
+async def handle_cover(client, message):
+    """Accept the cover image and prompt for videos."""
+    uid = message.from_user.id
+    # Initialize or reset admin data
+    if uid not in admin_data or admin_data[uid].get("videos"):
+        # Start new session
+        admin_data[uid] = {"cover": None, "videos": {}, "title": None, "season": None, "episode": None}
+    # Save the cover file_id
+    photo = message.photo[-1]  # largest size
+    admin_data[uid]["cover"] = photo.file_id
+    await message.reply("✅ Cover image received. Now send *exactly 3 videos* (480p, 720p, 1080p) with names like `Title S01 Ep01 [480p].mkv`.", 
+                        parse_mode="markdown")
+
+# Handler: Video files from admin
+@app.on_message((filters.video | filters.document) & filters.user(ADMIN_ID) & filters.private)
+async def handle_video(client, message):
+    """Collect exactly 3 video files, validate them, and prepare the preview."""
+    uid = message.from_user.id
+    data = admin_data.get(uid)
+    if not data or not data.get("cover"):
+        await message.reply("❗ Please send a cover image first.")
         return
 
-    await message.reply("👋 Hello! Please send the **cover photo** to begin.")
-
-@bot.on_message(filters.private & filters.photo)
-async def handle_cover(client, message: Message):
-    user_id = message.from_user.id
-    user_data[user_id] = {"cover": message.photo.file_id, "videos": []}
-    await message.reply("✅ Cover received.\n\nNow send **3 video/document files** (480p, 720p, 1080p).")
-
-@bot.on_message(filters.private & (filters.video | filters.document))
-async def handle_file(client, message: Message):
-    user_id = message.from_user.id
-    if user_id not in user_data or "cover" not in user_data[user_id]:
-        await message.reply("❗ Please send the **cover photo** first.")
+    # Ensure no more than 3 videos
+    if len(data["videos"]) >= 3:
+        await message.reply("❗ Already received 3 videos. Use /cancel to start again.")
         return
 
-    file = message.video or message.document
-    file_name = file.file_name
-    file_id = file.file_id
+    # Get the filename (supports both Video and Document)
+    file_name = None
+    if message.video and message.video.file_name:
+        file_name = message.video.file_name
+    elif message.document and message.document.file_name:
+        file_name = message.document.file_name
+    else:
+        await message.reply("❗ Video file must include a filename (e.g. `Title S01 Ep01 [480p].mkv`).")
+        return
 
-    # Parse title, episode, quality
-    match = re.search(r"(.*?)\s*[Ss](\d+)\s*[Ee]p(\d+).*?(\d{3,4}p)", file_name)
+    # Validate filename pattern
+    match = file_pattern.match(file_name)
     if not match:
-        await message.reply("❌ Filename must be like: `Title S01 Ep[01] [720p].mkv`")
+        await message.reply("❗ Filename format incorrect.\nUse: `Title S01 Ep01 [480p].mkv`, where '480p' can be 480p, 720p, or 1080p.")
         return
 
-    title = match.group(1).strip()
-    season = match.group(2)
-    episode = match.group(3)
-    quality = match.group(4)
+    title, season_str, episode_str, quality = match.groups()
+    season = int(season_str)
+    episode = int(episode_str)
+    quality = quality.lower()
 
-    user_data[user_id].update({"title": title, "season": season, "episode": episode})
+    # Check resolution is one of expected
+    if quality not in ("480p", "720p", "1080p"):
+        await message.reply("❗ Quality must be one of: 480p, 720p, 1080p.")
+        return
 
-    # Save file to DB channel
-    sent_msg = await client.send_document(DB_CHANNEL, file_id) if message.document else await client.send_video(DB_CHANNEL, file_id)
+    # If this is the first video, store title/season/episode
+    if not data["videos"]:
+        data["title"] = title
+        data["season"] = season
+        data["episode"] = episode
+    else:
+        # Ensure consistency with previous videos
+        if title != data["title"] or season != data["season"] or episode != data["episode"]:
+            await message.reply("❗ Title, season, or episode does not match previous videos.")
+            return
 
-    user_data[user_id]["videos"].append({
-        "file_id": sent_msg.message_id,
-        "quality": quality
-    })
+    # Check for duplicate quality
+    if quality in data["videos"]:
+        await message.reply(f"❗ Already received a {quality} video.")
+        return
 
-    await message.reply(f"✅ Saved **{quality}** file.")
+    # Save this video message object
+    data["videos"][quality] = message
+    await message.reply(f"✅ {quality} video received.")
 
-    # All 3 files received
-    if len(user_data[user_id]["videos"]) == 3:
-        buttons = [
-            [InlineKeyboardButton(v["quality"], url=f"https://t.me/{(await client.get_me()).username}?start=vid_{v['file_id']}")]
-            for v in user_data[user_id]["videos"]
+    # If we have all 3 videos, process and send preview
+    if len(data["videos"]) == 3:
+        # Copy each video to the DB channel and save the message IDs
+        db_ids = {}
+        for q, msg_obj in data["videos"].items():
+            # Use copy_message to avoid forwarding link to original
+            forwarded = await client.copy_message(DB_CHANNEL, from_chat_id=msg_obj.chat.id, message_id=msg_obj.id)
+            db_ids[q] = forwarded.id
+        data["db_ids"] = db_ids
+
+        # Build inline keyboard for qualities and Send button
+        buttons = []
+        # Two buttons on first row (480p, 720p), two on second (1080p, Send)
+        # Ensure we have the bot username for deep links
+        me = await client.get_me()
+        bot_username = me.username
+        # 480p and 720p buttons
+        row1 = []
+        for q in ("480p", "720p"):
+            if q in db_ids:
+                url = f"https://t.me/{bot_username}?start=vid_{db_ids[q]}"
+                row1.append(InlineKeyboardButton(q, url=url))
+        buttons.append(row1)
+        # 1080p and Send buttons
+        row2 = []
+        if "1080p" in db_ids:
+            url = f"https://t.me/{bot_username}?start=vid_{db_ids['1080p']}"
+            row2.append(InlineKeyboardButton("1080p", url=url))
+        row2.append(InlineKeyboardButton("Send", callback_data="send"))
+        buttons.append(row2)
+
+        # Send the preview with cover and inline buttons to the admin
+        caption = f"*{data['title']}* S{data['season']:02d} Ep{data['episode']:02d}\nSelect a quality:"
+        await client.send_photo(uid, photo=data["cover"], caption=caption, 
+                                parse_mode="markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+# Handler: Inline button callback (Send button)
+@app.on_callback_query()
+async def on_button_click(client, callback_query):
+    """When admin clicks 'Send', post the preview to the target channel."""
+    data = admin_data.get(callback_query.from_user.id)
+    # Only handle the "send" callback from the current admin session
+    if callback_query.data == "send":
+        uid = callback_query.from_user.id
+        if uid != ADMIN_ID:
+            await callback_query.answer("Unauthorized", show_alert=True)
+            return
+        if not data or not data.get("db_ids"):
+            await callback_query.answer("❗ No videos to send.", show_alert=True)
+            return
+
+        # Prepare inline keyboard for the target channel (qualities only)
+        me = await client.get_me()
+        bot_username = me.username
+        db_ids = data["db_ids"]
+        # Inline keyboard with 480p/720p in first row, 1080p in second
+        kb = [
+            [
+                InlineKeyboardButton("480p", url=f"https://t.me/{bot_username}?start=vid_{db_ids['480p']}"),
+                InlineKeyboardButton("720p", url=f"https://t.me/{bot_username}?start=vid_{db_ids['720p']}"),
+            ],
+            [
+                InlineKeyboardButton("1080p", url=f"https://t.me/{bot_username}?start=vid_{db_ids['1080p']}")
+            ]
         ]
-        buttons.append([
-            InlineKeyboardButton("✅ Send", callback_data="send"),
-            InlineKeyboardButton("❌ Cancel", callback_data="cancel")
-        ])
+        # Post the cover image with title caption to the target channel
+        caption = f"*{data['title']}* S{data['season']:02d} Ep{data['episode']:02d}"
+        await client.send_photo(TARGET_CHANNEL, photo=data["cover"], caption=caption, 
+                                parse_mode="markdown", reply_markup=InlineKeyboardMarkup(kb))
+        await callback_query.answer("Posted to channel ✅")
+        # Reset admin data for next upload
+        admin_data.pop(uid, None)
 
-        caption = f"**{title}** - S{season.zfill(2)}E{episode.zfill(2)}\n\n🎥 Available Qualities:"
-        for v in user_data[user_id]["videos"]:
-            caption += f"\n🔹 {v['quality']}"
+# Handler: /start for users requesting a file
+@app.on_message(filters.command("start") & filters.private)
+async def start_handler(client, message):
+    """When a user sends /start vid_<id>, forward the corresponding file from the DB channel."""
+    uid = message.from_user.id
+    args = message.command
+    # Check if there's a parameter like "vid_<msg_id>"
+    if len(args) > 1 and args[1].startswith("vid_"):
+        vid_str = args[1].split("_", 1)[1]
+        if not vid_str.isdigit():
+            await message.reply("❗ Invalid link format.")
+            return
+        vid_id = int(vid_str)
+        try:
+            # Copy the message from DB_CHANNEL to the user
+            await client.copy_message(uid, from_chat_id=DB_CHANNEL, message_id=vid_id)
+        except Exception:
+            await message.reply("❗ Sorry, the requested file was not found.")
+    else:
+        await message.reply("👋 Welcome! Please use the download buttons to receive your files.")
 
-        await message.reply_photo(
-            photo=user_data[user_id]["cover"],
-            caption=caption,
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-
-@bot.on_callback_query()
-async def callback_handler(client, cb):
-    user_id = cb.from_user.id
-    if user_id not in user_data:
-        await cb.answer("❌ Session expired.", show_alert=True)
-        return
-
-    if cb.data == "cancel":
-        del user_data[user_id]
-        await cb.message.edit("❌ Post creation cancelled.")
-        return
-
-    if cb.data == "send":
-        data = user_data[user_id]
-        buttons = [
-            [InlineKeyboardButton(v["quality"], url=f"https://t.me/{(await client.get_me()).username}?start=vid_{v['file_id']}")]
-            for v in data["videos"]
-        ]
-
-        caption = f"**{data['title']}** - S{data['season'].zfill(2)}E{data['episode'].zfill(2)}\n\n🎥 Available Qualities:"
-        for v in data["videos"]:
-            caption += f"\n🔹 {v['quality']}"
-
-        await client.send_photo(
-            chat_id=TARGET_CHANNEL,
-            photo=data["cover"],
-            caption=caption,
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-
-        await cb.message.edit("✅ Post sent to channel!")
-        del user_data[user_id]
-
-bot.run()
+# Run the bot
+if __name__ == "__main__":
+    app.run()
