@@ -14,7 +14,7 @@ app = Client("anime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 sessions = {}
 
 # Regex for validating filenames
-video_pattern = re.compile(r"^(.+?)\s+S(\d{2})\s+Ep(\d{2})\s+(480p|720p|1080p)\.mkv$")
+video_pattern = re.compile(r"^(.+?)\s+S(\d{2})\s+Ep(\d{2})\s+(480p|720p|1080p)\.mkv$")
 
 @app.on_message(filters.command("upload") & filters.private)
 async def cmd_upload(client, message):
